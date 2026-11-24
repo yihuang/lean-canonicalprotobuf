@@ -1,210 +1,234 @@
 # Canonical Protobuf in Lean 4
 
-A mechanically verified implementation of a **canonical** (deterministic,
-byte-for-byte unique) subset of Protocol Buffers 3, with an executable encoder
-and a *strict* decoder, and machine-checked proofs about the round trip.
+A **canonical** subset of Protocol Buffers 3 — one value, one byte string — with an
+executable encoder, a decoder that accepts *only* canonical bytes, and a
+machine-checked proof that the two are mutually inverse.
 
-The design is derived from first principles rather than by copying an
-implementation; the reference [regen-network/canonical-proto3] "CER" rules were
-used as a sanity check.
+```lean
+theorem bijection (s : Schema) :
+    (∀ m : CanonicalMsg s, decode s (encode s m) = some m) ∧          -- round trip
+    (∀ (b : Bytes) (m : CanonicalMsg s), decode s b = some m → encode s m = b) ∧
+    (∀ m₁ m₂ : CanonicalMsg s, encode s m₁ = encode s m₂ → m₁ = m₂)   -- injective
+```
 
-[regen-network/canonical-proto3]: https://github.com/regen-network/canonical-proto3
+Status: **every theorem is proved, no `sorry`**, no dependencies beyond Lean core
+(≈2.2k lines). The only axioms are `propext`, `Quot.sound` and `Classical.choice`.
 
 ```
 CanonicalProtobuf/
   Wire.lean       minimal varints, little-endian fixed integers, length prefixes
-  Model.lean      schemas, values, canonicity predicate
+  Model.lean      schemas, values, the canonicity predicate `canonMsg`
   Encode.lean     the canonical encoder
   Decode.lean     the strict decoder
-  Proofs.lean     payload/parse lemmas, decoder soundness and completeness
-  Bijection.lean  encode/decode, soundness, injectivity, the bijection
-  Examples.lean   build-time executable round-trip and strictness tests
+  Proofs.lean     payload lemmas; decoder soundness and completeness
+  Bijection.lean  `encode`/`decode` on canonical messages; the bijection
+  Examples.lean   27 build-time checks (round trips and rejections)
 ```
 
-Build and test with `lake build`.  The `Examples.lean` file runs ~35
-round-trip / strictness checks at compile time; a failing check fails the build.
+## Why canonical, not merely deterministic
 
-**Status: every theorem in this repository is proved; there are no `sorry`s.**
-The main result is `CanonicalProto.bijection` (§3): the encoder and decoder are
-mutually inverse between canonical messages and the byte strings the decoder
-accepts.
+Proto3 has a "deterministic" serialisation mode, but it is not *canonical*: map
+ordering is left to the implementation, `NaN` payloads and `-0.0` survive, and
+unknown fields are preserved, so two conforming encoders can produce different
+bytes for the same value. That is fine for caching heuristics and fatal for
+anything that hashes, signs, or content-addresses wire bytes.
 
-## 1. What "canonical" means here
+The fix used here is to carve out a subset of the format where the encoding is a
+genuine bijection, and to make the decoder *reject* everything outside it —
+over-long varints, unpacked repeated runs, unknown fields, wrong field order,
+duplicate singular fields, non-minimal nesting. "Deterministic" then becomes a
+theorem rather than a promise, and a canonicalisation function is unnecessary:
+invalid inputs have no canonical form at all.
 
-A **schema** is a list of numbered fields; a **field type** is
+The design was derived from first principles;
+[regen-network/canonical-proto3] (the "CER" rules) was used as a sanity check.
 
+[regen-network/canonical-proto3]: https://github.com/regen-network/canonical-proto3
+
+## Quick start
+
+Requires [elan](https://github.com/leanprover/elan); the toolchain is pinned by
+`lean-toolchain`.
+
+```sh
+lake build     # compiles the proofs and runs the build-time checks
 ```
-scalar st | message schema | repeated t | optional st
+
+```lean
+import CanonicalProtobuf
+
+open CanonicalProto
+
+/-- `message User { string name = 1; int32 id = 2; repeated uint32 scores = 3; }` -/
+def userSchema : Schema :=
+  [(1, .scalar .string), (2, .scalar .int32), (3, .repeated (.scalar .uint32))]
+
+def alice : Msg :=
+  [(1, .scalar (.s (bytes [0x61, 0x6C]))),  -- name = "al"
+   (2, .scalar (.n 7)),                     -- id = 7
+   (3, .repeated [.n 1, .n 300])]           -- scores = [1, 300]
+
+#eval encodeMsg userSchema alice                                -- [10, 2, 97, 108, 16, 7, 26, 3, 1, 172, 2]
+#eval canonMsg userSchema alice                                 -- true
+#eval (decode userSchema (encodeMsg userSchema alice)).isSome    -- true
+#eval (decode userSchema (bytes [0x10, 0x80, 0x00])).isNone      -- true: over-long varint
 ```
 
-where `scalar` is one of `int32 int64 uint32 uint64 sint32 sint64 fixed32
-fixed64 sfixed32 sfixed64 bool enum string bytes`.
+(`bytes : List Nat → Bytes` is a convenience from `Examples.lean`; `Bytes` is
+`List UInt8`.)
 
-A **value** is a list of `(fieldNumber, value)` entries, where a value is a
-scalar, a nested message, or a packed run of scalars.
+## The verified interface
 
-The canonical encoding is:
+The codec is presented in layers, so that the proofs can talk about the codec
+and the API about canonical messages:
 
-| rule | implementation |
+| layer | type | role |
+|---|---|---|
+| `encodeMsg s : Msg → Bytes` | total | encodes any message; only correct on canonical ones |
+| `decodeBody : Nat → Schema → Nat → Bytes → Option Msg` | strict | fuel-bounded core decoder (bounds fields and nesting) |
+| `decodeBodyCanon : Schema → Bytes → Option Msg` | strict | `decodeBody (b.length + 1)`, then `canonMsg` re-validation |
+| `encode` / `decode` | `CanonicalMsg s ↔ Bytes` | the verified API |
+
+`CanonicalMsg s` is the subtype `{m // canonMsg s m = true}`, so a non-canonical
+value cannot even be passed to `encode`; `decode` returns `Option (CanonicalMsg s)`
+and is therefore total with no separate validity check at the call site.
+
+For any canonical message:
+
+```lean
+example (m : CanonicalMsg userSchema) : decode userSchema (encode userSchema m) = some m :=
+  decode_encode m
+
+example (b : Bytes) (m : CanonicalMsg userSchema) :
+    (decode userSchema b = some m) ↔ (encode userSchema m = b) :=
+  decode_eq_some_iff userSchema b m
+```
+
+The second is the sharp form of "strict": the decoder's accepted set is *exactly*
+the image of the encoder, and each accepted byte string has a unique preimage.
+
+## Canonical form
+
+A schema is a list of numbered fields; a field type is `scalar st`,
+`message schema`, `repeated t` or `optional st`. A message is a list of
+`(fieldNumber, value)` entries; a repeated field is written as adjacent entries
+sharing its number, and a packed run as one `.repeated` entry.
+
+| rule | enforced by |
 |---|---|
-| fields in ascending field-number order | `sortedOk`, emitted in value order |
+| field numbers strictly increasing (equal only for repeated fields) | `sortedOk` |
 | no default-valued plain scalars (`0`, `false`, `""`, empty bytes, enum 0) | `canonField` |
-| `optional` scalars keep explicit presence (defaults are encoded) | `canonField` `.optional` |
-| empty repeated fields / unset oneofs are absent | no entry |
-| packable repeated scalars use **packed** length-delimited encoding | `Decode.parsePiece` |
-| repeated strings/bytes/messages use one occurrence per element | `FieldTy.isMulti` |
-| nested messages canonical recursively | `canonMsg` |
-| `bool` restricted to 0/1; integers in their declared range (signed 32-bit sign-extended) | `inRange` |
-| strings are valid UTF-8 | `utf8Valid` |
-| varints are minimal; exactly 32/64-bit fixed fields | `varintDecode`, `leRead` |
-| unknown fields, wrong order, duplicates, trailing bytes are **rejected** | `decodeBody` |
-| floats are raw IEEE-754 bit patterns (`fixed32`/`fixed64`) | see below |
+| `optional` scalars always encoded, defaults included | `canonField` |
+| packable repeated scalars: exactly one packed run, never empty | `canonRep` |
+| repeated strings/bytes/messages: one length-delimited occurrence per element | `canonRep`, `FieldTy.isMulti` |
+| nested messages canonical recursively; every field number known | `fieldsOk` |
+| `bool` ∈ {0, 1}; integers in their declared range | `SVal.ok`, `inRange` |
+| `int32`/`enum` sign-extended to 64 bits on the wire; `sint*` zigzag | `inRange`, `Encode` |
+| strings valid UTF-8 (no overlong forms, no surrogates) | `utf8Valid` |
+| minimal varints; exactly 4/8 bytes for `fixed32`/`fixed64` | `Wire.lean` |
+| over-long varints, unpacked runs, unknown fields, wrong order, duplicates, trailing bytes rejected | `decodeBody` |
 
-Maps are deliberately **excluded** (as in the reference CER spec): a canonical
-map needs a total order on keys, and the ordering interacts with default
-omission in ways that deserve their own proof; the model has a place for them
-(`FieldTy`), but the codec does not implement them.
+## Scope
 
-Floats are represented by their IEEE-754 *bit pattern* because protobuf's
-"deterministic" mode does not canonicalise `NaN` payloads or `-0.0`; preserving
-the bits is the only choice that keeps a genuine bijection.  `float`/`double`
-fields are therefore spelled `fixed32`/`fixed64`.
+This is a codec model, not a protobuf compiler: schemas are Lean values, and
+there is no `.proto` parser, no code generation, and no JSON/text format.
 
-## 2. Two design decisions that make the proofs work
+Deliberately out of scope:
 
-**(a) The canonical form is a predicate, not a normalisation function.**
-`canonMsg s m : Bool` characterises legal canonical values (ordered numbers,
-canonical scalars, sorted map keys, ...).  The theorems are stated for
-`{m // canonMsg s m}`, so non-canonical values are unrepresentable in the
-statement, and the encoder never has to sort or repair anything: sortedness is
-part of the hypothesis.  This is why the round-trip proof is a structural
-induction instead of an argument about sorting algorithms.
+* **Maps** — a canonical map needs a total order on keys, and that ordering
+  interacts with default omission in ways worth their own proof. (The reference
+  CER spec excludes them too.)
+* **`oneof` and groups** — not modelled.
+* **`float`/`double`** — represented by their IEEE-754 bit patterns, spelled
+  `fixed32`/`fixed64`. Deterministic proto3 does not canonicalise `NaN` payloads
+  or `-0.0`, so preserving bits is the only choice that keeps a bijection.
+* **Unknown-field preservation, extensions, wire compatibility** — with ordinary
+  protobuf data this decoder will often reject rather than decode; that is the
+  point, not a defect.
 
-**(b) Repeated fields are "one entry per element" (plus one packed entry).**
-A repeated field's value appears either as one packed entry (numeric scalars) or
-as a run of adjacent entries with the same field number (strings, bytes,
-messages).  The decoder therefore never has to *merge* anything: it conses each
-parsed element and checks that equal field numbers occur only for repeated
-fields.  Earlier iterations merged occurrences during parsing; that made both
-the decoder and its proof markedly more complicated.
+`encodeMsg` is total and returns `[]` on malformed input; well-definedness is a
+hypothesis (`canonMsg`), not a check inside the encoder.
 
-## 3. What is proved
+## What is proved
 
-Every theorem is machine-checked with no `sorry`; the only axioms used are
-Lean's standard ones (`propext`, `Quot.sound`, and `Classical.choice` for the
-decidable-predicate plumbing).
+**Wire level** (`Wire.lean`) — `varintDecode_encode` (decode inverts the minimal
+encoding, for every `n`), `varintDecode_sound` (successful decode implies the
+input *is* the minimal encoding), `leRead_leBytes`/`leRead_bytes` (fixed-width
+round trips), `split_sound`/`split_of_length` (length prefixes).
 
-**Wire level** (`Wire.lean`)
+**Payloads** (`Proofs.lean`) — `parseScalarPayload_sound`/`_complete`,
+`parseLen_sound`/`_complete`, `unpack_sound`/`unpack_complete`: the scalar,
+length-delimited and packed-run codecs are inverse on canonical payloads.
+`parsePiece_full_sound` and `parsePiece_complete` lift this to whole fields and
+carry the matching encoder equation.
 
-* `varintDecode_encode` : decoding the canonical varint of `n` returns `n` and
-  the untouched suffix (for *every* `n`; encoding is exact, not truncated).
-* `varintDecode_sound` : a successful decode satisfies
-  `varintEncode v ++ rest = input` — this is exactly minimality.
-* `leRead_leBytes`, `leRead_bytes` : 32/64-bit little-endian round trip.
-* `split_sound`, `split_of_length` : length-delimited prefix splitting.
+**Decoder** (`Proofs.lean`, `Bijection.lean`)
 
-**Payloads** (`Proofs.lean`)
+| theorem | statement |
+|---|---|
+| `decodeBody_sound` | accepted bytes re-encode to themselves |
+| `decodeBody_complete` | every canonical encoding is accepted and recovered (given `orderOk`) |
+| `decodeBodyCanon_encodeMsg` | the strict top-level decoder inverts `encodeMsg` |
+| `decode_injective` | at most one message decodes from any byte string |
+| `decode_eq_some_iff` | accepted set = image of `encode`, preimage unique |
 
-* `parseScalarPayload_sound` / `_complete`, `parseLen_sound` / `_complete`,
-  `unpackAux_sound`, `unpack_sound`, `unpack_complete` : the scalar, length and
-  packed-run codecs are inverse on canonical values.
-* `parsePiece_full_sound`, `parsePiece_complete` : the *field* payload parser is
-  both sound (it consumes exactly the canonical payload) and complete (it
-  accepts every canonical payload), together with the matching encoder equation.
-* `canonMsg_cons`, `canonMsg_facts`, `canonMsg_orderOk` : structural facts about
-  canonical messages.
+## Design notes
 
-**Decoder soundness** (`Proofs.lean`, `Bijection.lean`)
+**Canonicity is a predicate, not a normalisation function.**
+`canonMsg s : Msg → Bool` characterises legal values, and the theorems are stated
+at `{m // canonMsg s m}`. Since sortedness and default-omission are hypotheses,
+the encoder never sorts or repairs anything, and the round-trip proof is a
+structural induction rather than an argument about a sorting algorithm. The price
+is that the encoder is only *correct* on canonical inputs — which is exactly what
+the subtype enforces.
 
-* `decodeBody_sound` : for every byte string accepted by the decoder,
-  `encodeMsg s m = b`.  In other words the decoder never accepts a byte string
-  that is not the canonical encoding of what it returns; over-long varints,
-  unpacked runs, unknown fields, wrong order, out-of-range values and
-  non-canonical nesting are all rejected.
-* `decodeBodyCanon_sound`, `decode_sound` : the same at the top level.
-* `decode_injective` : at most one message decodes from any byte string.
+**Repeated fields are one entry per element.** For packable scalars a repeated
+field is a single packed entry; for strings, bytes and messages it is a run of
+adjacent entries with the same field number. The decoder therefore never *merges*
+occurrences: it conses each parsed element and requires that non-increasing field
+numbers occur only on repeated fields. An earlier design merged during parsing,
+which complicated both the decoder and its proof considerably.
 
-**Decoder completeness** (`Proofs.lean`)
+**The one real proof obstacle.** `decodeBody` recurses on a `Nat` fuel and matches
+on the byte list, so its equation lemmas only fire when the buffer is
+*syntactically* a cons. Completeness must evaluate it at `encodeMsg s m`, which is
+an **append** built by a `brecOn` recursion — and the key prefix `varintEncode key`
+is not syntactically a cons either, so `rw`/`simp` refuse to reduce the `match`.
+The mathematics was never the hard part; the elaborator was.
 
-* `decodeBody_key` : a generic unfolding lemma for the decoder at a field key
-  (the technical crux — see §4).
-* `decodeBody_complete` : for every canonical message `m` and every `fuel`
-  bounding `(encodeMsg s m).length`,
-  `decodeBody (fuel+1) s last (encodeMsg s m) = some m`, provided the ordering
-  invariant `orderOk s last m` holds.
-* `decodeBodyCanon_encodeMsg`, `decode_encode` : `decode (encode m) = some m`.
-
-**The bijection** (`Bijection.lean`)
-
-* `bijection` : `encode` and `decode` are mutually inverse and `encode` is
-  injective — a bijection between canonical messages `{m // canonMsg s m}` and
-  the byte strings the decoder accepts.
-* `decode_eq_some_iff` : `decode s b = some m ↔ encode s m = b`, i.e. the
-  decoder's accepted set is *exactly* the image of the encoder, and the
-  preimage is unique.
-
-## 4. The one technical obstacle (and how it was removed)
-
-The decoder is written as
+The fix is one generic unfolding lemma,
 
 ```lean
-def decodeBody : Nat → Schema → Nat → Bytes → Option Msg
-  | 0, _, _, _ => none
-  | fuel+1, s, last, b =>
-      match b with
-      | [] => some []
-      | _  => ... match varintDecode b, findField s .., parsePiece .. ...
+theorem decodeBody_key (fuel s last key k1 ks rest) (hk : varintEncode key = k1 :: ks) :
+    decodeBody (fuel+1) s last (k1 :: (ks ++ rest)) = ...decoder step...
 ```
 
-so its equation lemmas (`decodeBody.eq_3`) only fire when the buffer is
-*syntactically* a cons.  Completeness, however, must evaluate the decoder at
-`encodeMsg s m`, which is an **append** produced by a recursive (`brecOn`)
-definition, and the key prefix `varintEncode key` is not syntactically a cons
-either: `rw`/`simp` refuse to reduce a `match` on those shapes.  This is the
-whole difficulty of the completeness direction (the mathematics was never the
-problem — all payload-level lemmas were already available).
+after which completeness is routine: destruct `varintEncode key` into `k1 :: ks`
+(`varintEncode_nonempty` eliminates the empty case), reassociate the append into
+cons form, apply `decodeBody_key`, and discharge one goal per field type with
+`parsePiece_complete` plus the induction hypothesis.
 
-The fix is `decodeBody_key`, a generic unfolding lemma proved once:
+## Tests
 
-```lean
-theorem decodeBody_key (fuel s last key k1 ks rest)
-    (hk : varintEncode key = k1 :: ks) :
-    decodeBody (fuel+1) s last (k1 :: (ks ++ rest)) = ... decoder step ...
-```
-
-Completeness then (i) destructs `varintEncode key` into `k1 :: ks`
-(`varintEncode_nonempty` rules out the empty branch), (ii) reassociates the
-append into cons form, (iii) applies `decodeBody_key`, and (iv) discharges the
-resulting per-field goals with `parsePiece_complete` and the induction
-hypothesis.  Steps (i)–(iii) are the only place where the append/cons mismatch
-occurs; everything after it is ordinary rewriting, one case per field type.
-
-## 5. Worked examples
-
-`Examples.lean` includes a `Person` schema and checks, at build time:
+`Examples.lean` runs 27 checks at compile time; a failing check fails the build:
 
 ```
-#eval check "person1" (encodeMsg personSchema person1 == person1Bytes)
--- 0a 02 41 6c | 10 2a | 1a 03 01 ac 02 | 32 01 78 | 32 01 79
---  name="Al"   id=42   scores=[1,300]    tags=["x","y"]
-
-#eval check "..." (roundtrip personSchema [(5, .message [])])   -- empty nested message
-#eval check "..." ((decodeBodyCanon personSchema (bytes [0x10, 0x80, 0x00])).isNone)
--- over-long varint for field 2 is rejected
+ok: person encodes to the expected bytes
+ok: person round-trips
+ok: default scalar is not canonical
+ok: optional zero encodes its presence
+ok: over-long varint is rejected
+ok: wrong field order is rejected
+ok: non-canonical nested message is rejected
+ok: min int32 is a ten-byte sign-extended varint
+ok: sint32 zigzags -150 to 300
+ok: fixed32 is little-endian
+ok: invalid UTF-8 is not canonical
+...
 ```
 
-and similarly for sign-extended `int32`, zigzag `sint32`, little-endian
-`fixed32`, `bool` range checks, UTF-8 validation, out-of-range integers,
-non-canonical nested messages, unknown fields, wrong field order, unpacked runs
-and truncated payloads.
-
-## 6. Environment note
-
-The project is pure Lean 4 (core + `Std`), no Mathlib: `lakefile.toml` declares
-no dependencies, which keeps builds fast and memory-light (the proofs are
-first-order list/Nat reasoning, handled by `simp`/`omega`).
-
-On this machine the packaged Lean toolchain's `cc` wrapper pointed at a missing
-Nix store path, so `~/.elan/toolchains/.../bin/cc` was replaced with a wrapper
-around the system `gcc`.  That is an environment fix, not part of the project;
-on a normal installation `lake build` works as-is.
+They cover round trips (including empty nested messages), default omission versus
+explicit `optional` presence, sign-extended `int32`, zigzag `sint32`,
+little-endian `fixed32`, `bool` range checks, UTF-8 validation, out-of-range
+integers, and rejection of over-long varints, unknown fields, wrong field order,
+unpacked runs, truncated payloads and non-canonical nesting.
