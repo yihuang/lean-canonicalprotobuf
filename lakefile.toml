@@ -1,0 +1,5 @@
+name = "canonicalprotobuf"
+defaultTargets = ["CanonicalProtobuf"]
+
+[[lean_lib]]
+name = "CanonicalProtobuf"

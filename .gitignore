@@ -1,0 +1,7 @@
+# Lean build artifacts
+.lake/
+*.olean
+*.ilean
+*.c
+*.o
+*.trace.json
