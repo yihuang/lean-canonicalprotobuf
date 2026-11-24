@@ -85,8 +85,8 @@ and the API about canonical messages:
 | layer | type | role |
 |---|---|---|
 | `encodeMsg s : Msg → Bytes` | total | encodes any message; only correct on canonical ones |
-| `decodeBody : Nat → Schema → Nat → Bytes → Option Msg` | strict | fuel-bounded core decoder (bounds fields and nesting) |
-| `decodeBodyCanon : Schema → Bytes → Option Msg` | strict | `decodeBody (b.length + 1)`, then `canonMsg` re-validation |
+| `decodeBody : Schema → Nat → Bytes → Option Msg` | strict | core decoder, well-founded recursion on the buffer length |
+| `decodeBodyCanon : Schema → Bytes → Option Msg` | strict | `decodeBody s 0 b`, then `canonMsg` re-validation |
 | `encode` / `decode` | `CanonicalMsg s ↔ Bytes` | the verified API |
 
 `CanonicalMsg s` is the subtype `{m // canonMsg s m = true}`, so a non-canonical
@@ -189,23 +189,38 @@ occurrences: it conses each parsed element and requires that non-increasing fiel
 numbers occur only on repeated fields. An earlier design merged during parsing,
 which complicated both the decoder and its proof considerably.
 
-**The one real proof obstacle.** `decodeBody` recurses on a `Nat` fuel and matches
-on the byte list, so its equation lemmas only fire when the buffer is
-*syntactically* a cons. Completeness must evaluate it at `encodeMsg s m`, which is
-an **append** built by a `brecOn` recursion — and the key prefix `varintEncode key`
-is not syntactically a cons either, so `rw`/`simp` refuse to reduce the `match`.
-The mathematics was never the hard part; the elaborator was.
+**Termination is well-founded recursion on the buffer length.** `decodeBody`
+recurses on a *suffix* of its input rather than on a subterm, so no structural
+decrease is available — but no fuel argument is needed either: every parse step
+consumes at least one byte (`varintDecode_lt`, `leRead`, `split`), so both the
+remaining buffer and a nested message's chunk are strictly shorter than the
+buffer being parsed. Both `decodeBody` and `unpackAux` are therefore declared
+`termination_by b.length`, and `decreasing_by` discharges the two obligations
+from the "returns a suffix" lemmas `parsePiece_snd_lt` and `parsePiece_chunk_le`;
+`utf8Valid` already used the same device. An earlier version threaded an explicit
+`Nat` fuel instead, which made every completeness statement carry a
+`(encodeMsg s m).length ≤ fuel` hypothesis for no mathematical gain.
+
+**The one real proof obstacle** is an elaborator problem, not a mathematical one.
+`decodeBody` matches on the byte list, so its equation lemma only fires when the
+buffer is *syntactically* a cons. Completeness must evaluate it at
+`encodeMsg s m`, which is an **append** built by a `brecOn` recursion — and the
+key prefix `varintEncode key` is not syntactically a cons either, so `rw`/`simp`
+refuse to reduce the `match`.
 
 The fix is one generic unfolding lemma,
 
 ```lean
-theorem decodeBody_key (fuel s last key k1 ks rest) (hk : varintEncode key = k1 :: ks) :
-    decodeBody (fuel+1) s last (k1 :: (ks ++ rest)) = ...decoder step...
+theorem decodeBody_key (s last key ty pr k1 ks rest)
+    (hk : varintEncode key = k1 :: ks) (hfind : findField s (key / 8) = some ty)
+    (hpiece : parsePiece ty (key % 8) rest = some pr) ... :
+    decodeBody s last (k1 :: (ks ++ rest)) = ...decoder step...
 ```
 
 after which completeness is routine: destruct `varintEncode key` into `k1 :: ks`
 (`varintEncode_nonempty` eliminates the empty case), reassociate the append into
-cons form, apply `decodeBody_key`, and discharge one goal per field type with
+cons form, apply `decodeBody_key` with the `findField` and `parsePiece` equations
+that the branch already knows, and discharge one goal per field type with
 `parsePiece_complete` plus the induction hypothesis.
 
 ## Tests

@@ -62,8 +62,7 @@ message. -/
 theorem decodeBodyCanon_encodeMsg {s : Schema} {m : Msg} (hc : canonMsg s m = true) :
     decodeBodyCanon s (encodeMsg s m) = some m := by
   unfold decodeBodyCanon
-  have hlen : (encodeMsg s m).length ≤ (encodeMsg s m).length := Nat.le_refl _
-  rw [decodeBody_complete (encodeMsg s m).length s 0 m hlen hc (canonMsg_orderOk hc)]
+  rw [decodeBody_complete s 0 m hc (canonMsg_orderOk hc)]
   simp [hc]
 
 /-- The decoder inverts the encoder on canonical messages. -/
