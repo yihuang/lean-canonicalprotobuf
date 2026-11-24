@@ -1,7 +1,9 @@
 /-
   Canonical Protobuf: executable examples.
 
-  `#guard` checks are evaluated by the compiler at build time.
+  Each `#eval check` is evaluated by the compiler during `lake build`; a failing
+  check aborts the build, so building the project doubles as a test suite for
+  the encoder, the strict decoder and the canonicity predicate.
 -/
 import CanonicalProtobuf.Proofs
 
@@ -20,7 +22,12 @@ def roundtrip (s : Schema) (m : Msg) : Bool :=
   | some m' => msgBeq m m'
   | none => false
 
-/-! ```proto
+/- Strictness check: the decoder rejects `b` outright. -/
+def rejected (s : Schema) (b : Bytes) : Bool := (decodeBodyCanon s b).isNone
+
+/-! ### A schema and an example message
+
+```proto
 message Friend { string name = 1; int32 id = 2; }
 message Person {
   string          name   = 1;
@@ -30,7 +37,9 @@ message Person {
   Friend          friend = 5;
   repeated string tags   = 6;   // one occurrence per element
 }
-``` -/
+```
+-/
+
 def friendSchema : Schema := [(1, .scalar .string), (2, .scalar .int32)]
 
 def personSchema : Schema :=
@@ -48,58 +57,87 @@ def person1 : Msg :=
 def person1Bytes : Bytes := bytes [0x0a, 0x02, 0x41, 0x6c, 0x10, 0x2a,
   0x1a, 0x03, 0x01, 0xac, 0x02, 0x32, 0x01, 0x78, 0x32, 0x01, 0x79]
 
-#eval check "example" (encodeMsg personSchema person1 == person1Bytes)
-#eval check "example" (canonMsg personSchema person1 == true)
-#eval check "example" (roundtrip personSchema person1)
+#eval check "person encodes to the expected bytes"
+  (encodeMsg personSchema person1 == person1Bytes)
+#eval check "person is canonical" (canonMsg personSchema person1)
+#eval check "person round-trips" (roundtrip personSchema person1)
 
-/- Nested messages, including an empty one, round-trip. -/
+/-! ### Nested messages -/
+
 def nested : Msg := [(5, .message [(1, .scalar (.s al))])]
-#eval check "example" (roundtrip personSchema nested)
-#eval check "example" (roundtrip personSchema [(5, .message [])])
+#eval check "nested message round-trips" (roundtrip personSchema nested)
+#eval check "empty nested message round-trips"
+  (roundtrip personSchema [(5, .message [])])
 
-/- Default scalars are not canonical ... -/
-#eval check "example" (canonMsg personSchema [(2, .scalar (.n 0))] == false)
-/- ... while explicit `optional` presence is. -/
-#eval check "example" (encodeMsg [(1, .optional .int32)] [(1, .scalar (.n 0))] == bytes [0x08, 0x00])
-#eval check "example" (canonMsg [(1, .optional .int32)] [(1, .scalar (.n 0))] == true)
+/-! ### Defaults and explicit presence -/
 
-/- Strict rejection: over-long varint, wrong order, unknown field, unpacked run,
-truncated payload. -/
-#eval check "example" ((decodeBodyCanon personSchema (bytes [0x10, 0x80, 0x00])).isNone)
-#eval check "example" ((decodeBodyCanon personSchema (bytes [0x10, 0x01, 0x08, 0x41])).isNone)
-#eval check "example" ((decodeBodyCanon personSchema (bytes [0x78, 0x01])).isNone)
-#eval check "example" ((decodeBodyCanon personSchema (bytes [0x18, 0x01])).isNone)
-#eval check "example" ((decodeBodyCanon personSchema (bytes [0x0a, 0x02, 0x41])).isNone)
+def optInt32 : Schema := [(1, .optional .int32)]
+#eval check "default scalar is not canonical"
+  (!(canonMsg personSchema [(2, .scalar (.n 0))]))
+#eval check "optional zero encodes its presence"
+  (encodeMsg optInt32 [(1, .scalar (.n 0))] == bytes [0x08, 0x00])
+#eval check "optional zero is canonical" (canonMsg optInt32 [(1, .scalar (.n 0))])
 
-/- A non-canonical nested message is rejected (default scalar written out). -/
-#eval check "example" ((decodeBodyCanon friendSchema (bytes [0x0a, 0x01, 0x41, 0x10, 0x00])).isNone)
+/-! ### Strict rejection
 
-/- Negative int32: ten-byte sign-extended varint. -/
-def minInt32 : Bytes := bytes [0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
-#eval check "example" (encodeMsg [(1, .scalar .int32)] [(1, .scalar (.n (2 ^ 64 - 1)))] == minInt32)
-#eval check "example" (roundtrip [(1, .scalar .int32)] [(1, .scalar (.n (2 ^ 64 - 1)))])
+Over-long varint, wrong field order, unknown field, unpacked run, truncated
+payload, and a nested message with a default scalar written out. -/
 
-/- `sint32` zigzag: 1 denotes -1; 300 denotes 150. -/
-#eval check "example" (encodeMsg [(1, .scalar .sint32)] [(1, .scalar (.n 1))] == bytes [0x08, 0x01])
-#eval check "example" (encodeMsg [(1, .scalar .sint32)] [(1, .scalar (.n 300))] == bytes [0x08, 0xac, 0x02])
+#eval check "over-long varint is rejected"
+  (rejected personSchema (bytes [0x10, 0x80, 0x00]))
+#eval check "wrong field order is rejected"
+  (rejected personSchema (bytes [0x10, 0x01, 0x08, 0x41]))
+#eval check "unknown field is rejected"
+  (rejected personSchema (bytes [0x78, 0x01]))
+#eval check "unpacked run is rejected"
+  (rejected personSchema (bytes [0x18, 0x01]))
+#eval check "truncated payload is rejected"
+  (rejected personSchema (bytes [0x0a, 0x02, 0x41]))
+#eval check "non-canonical nested message is rejected"
+  (rejected friendSchema (bytes [0x0a, 0x01, 0x41, 0x10, 0x00]))
 
-/- `fixed32` is little-endian. -/
-#eval check "example" (encodeMsg [(1, .scalar .fixed32)] [(1, .scalar (.n 0x01020304))] == bytes [0x0d, 0x04, 0x03, 0x02, 0x01])
+/-! ### Integer encodings -/
 
-/- `bool` is canonical only for 0 and 1. -/
-#eval check "example" (canonMsg [(1, .scalar .bool)] [(1, .scalar (.n 1))] == true)
-#eval check "example" (canonMsg [(1, .scalar .bool)] [(1, .scalar (.n 2))] == false)
+def minInt32 : Msg := [(1, .scalar (.n (2 ^ 64 - 1)))]   -- -2147483648, sign-extended
+def minInt32Bytes : Bytes := bytes [0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+  0xff, 0xff, 0x01]
 
-/- Values outside the declared range are rejected. -/
-#eval check "example" (canonMsg [(1, .scalar .uint32)] [(1, .scalar (.n (2 ^ 32)))] == false)
-#eval check "example" ((decodeBodyCanon [(1, .scalar .uint32)] (bytes [0x08, 0x80, 0x80, 0x80, 0x80, 0x10])).isNone)
+#eval check "min int32 is a ten-byte sign-extended varint"
+  (encodeMsg [(1, .scalar .int32)] minInt32 == minInt32Bytes)
+#eval check "min int32 round-trips" (roundtrip [(1, .scalar .int32)] minInt32)
 
-/- Strings must be valid UTF-8. -/
-#eval check "example" (canonMsg [(1, .scalar .string)] [(1, .scalar (.s (bytes [0xff])))] == false)
-#eval check "example" (canonMsg [(1, .scalar .string)] [(1, .scalar (.s al))] == true)
+#eval check "sint32 zigzags -1 to 1"
+  (encodeMsg [(1, .scalar .sint32)] [(1, .scalar (.n 1))] == bytes [0x08, 0x01])
+#eval check "sint32 zigzags -150 to 300"
+  (encodeMsg [(1, .scalar .sint32)] [(1, .scalar (.n 300))] == bytes [0x08, 0xac, 0x02])
 
-/- Repeated strings are one occurrence each; empty runs are not canonical. -/
-#eval check "example" ((decodeBodyCanon [(1, .repeated (.scalar .string))] (bytes [0x0a, 0x00])).isSome)
-#eval check "example" (canonMsg [(1, .repeated (.scalar .string))] [(1, .scalar (.s al))] == true)
+#eval check "fixed32 is little-endian"
+  (encodeMsg [(1, .scalar .fixed32)] [(1, .scalar (.n 0x01020304))]
+    == bytes [0x0d, 0x04, 0x03, 0x02, 0x01])
+
+/-! ### Range and UTF-8 checks -/
+
+#eval check "bool 1 is canonical" (canonMsg [(1, .scalar .bool)] [(1, .scalar (.n 1))])
+#eval check "bool 2 is not canonical"
+  (!(canonMsg [(1, .scalar .bool)] [(1, .scalar (.n 2))]))
+
+def bigUint32 : Msg := [(1, .scalar (.n (2 ^ 32)))]
+#eval check "uint32 above 2^32 is not canonical"
+  (!(canonMsg [(1, .scalar .uint32)] bigUint32))
+#eval check "uint32 above 2^32 is rejected on the wire"
+  (rejected [(1, .scalar .uint32)] (bytes [0x08, 0x80, 0x80, 0x80, 0x80, 0x10]))
+
+#eval check "invalid UTF-8 is not canonical"
+  (!(canonMsg [(1, .scalar .string)] [(1, .scalar (.s (bytes [0xff])))]))
+#eval check "valid UTF-8 is canonical"
+  (canonMsg [(1, .scalar .string)] [(1, .scalar (.s al))])
+
+/-! ### Repeated fields -/
+
+def tagSchema : Schema := [(1, .repeated (.scalar .string))]
+#eval check "empty repeated element is accepted"
+  ((decodeBodyCanon tagSchema (bytes [0x0a, 0x00])).isSome)
+#eval check "repeated string is canonical"
+  (canonMsg tagSchema [(1, .scalar (.s al))])
 
 end CanonicalProto
